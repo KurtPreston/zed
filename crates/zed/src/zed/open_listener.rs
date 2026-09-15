@@ -1470,6 +1470,52 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_open_options_for_remote_request_respects_cli_default_open_behavior(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::UpdateGlobal as _;
+
+        let _app_state = init_test(cx);
+
+        let location = SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Ssh(
+            SshConnectionOptions {
+                host: "example-host".into(),
+                ..Default::default()
+            },
+        ));
+
+        // `cli_default_open_behavior` defaults to `existing_window`, which asks
+        // for the project to join an already-open window for the same host.
+        // `MatchExact` must be preserved so an already-open project is still
+        // activated instead of being opened a second time.
+        let options =
+            cx.update(|cx| open_options_for_behavior(cli::OpenBehavior::Default, &location, cx));
+        assert_eq!(
+            options.workspace_matching,
+            workspace::WorkspaceMatching::MatchExact
+        );
+        assert!(options.add_dirs_to_sidebar);
+        assert!(options.should_reuse_existing_window());
+        assert!(options.requesting_window.is_none());
+
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.cli_default_open_behavior =
+                        Some(settings::CliDefaultOpenBehavior::NewWindow);
+                });
+            });
+        });
+        let options =
+            cx.update(|cx| open_options_for_behavior(cli::OpenBehavior::Default, &location, cx));
+        assert_eq!(
+            options.workspace_matching,
+            workspace::WorkspaceMatching::MatchSubpaths
+        );
+        assert!(!options.add_dirs_to_sidebar);
+    }
+
+    #[gpui::test]
     fn test_parse_agent_url(cx: &mut TestAppContext) {
         let _app_state = init_test(cx);
 

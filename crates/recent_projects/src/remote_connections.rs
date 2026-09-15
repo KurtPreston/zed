@@ -16,10 +16,10 @@ use remote::{
 };
 pub use settings::SshConnection;
 use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
-use util::paths::PathWithPosition;
+use util::{ResultExt as _, paths::PathWithPosition};
 use workspace::{
     AppState, MultiWorkspace, OpenOptions, SerializedWorkspaceLocation, Workspace,
-    find_existing_workspace,
+    find_existing_workspace, workspace_windows_for_location,
 };
 
 pub use remote_connection::{
@@ -129,18 +129,14 @@ pub async fn open_remote_project(
     connection_options: RemoteConnectionOptions,
     paths: Vec<PathBuf>,
     app_state: Arc<AppState>,
-    open_options: workspace::OpenOptions,
+    mut open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
-    let created_new_window = open_options.requesting_window.is_none();
+    let location = SerializedWorkspaceLocation::Remote(connection_options.clone());
 
-    let (existing, open_visible) = find_existing_workspace(
-        &paths,
-        &open_options,
-        &SerializedWorkspaceLocation::Remote(connection_options.clone()),
-        cx,
-    )
-    .await;
+    let (existing, open_visible) =
+        find_existing_workspace(&paths, &open_options, &location, cx).await;
+    let matched_existing_workspace = existing.is_some();
 
     if let Some((existing_window, existing_workspace)) = existing {
         let remote_connection = cx.update(|cx| {
@@ -200,6 +196,42 @@ pub async fn open_remote_project(
             "existing remote workspace found but connection is dead, starting fresh connection"
         );
     }
+
+    // No open workspace holds these paths. Mirror the local `open_paths`
+    // fallback: when the open behavior asks for the existing window, add the
+    // project to a window already connected to this host instead of opening a
+    // new one. `activate` only retains the previously displayed workspace when
+    // multi-workspace is enabled, so windows without it are not candidates.
+    if !matched_existing_workspace
+        && open_options.should_reuse_existing_window()
+        && open_options.add_dirs_to_sidebar
+        && open_options.requesting_window.is_none()
+    {
+        let target_window = cx.update(|cx| {
+            let windows = workspace_windows_for_location(&location, cx);
+            let window = cx
+                .active_window()
+                .and_then(|window| window.downcast::<MultiWorkspace>())
+                .filter(|window| windows.contains(window))
+                .or_else(|| windows.into_iter().next());
+            window.filter(|window| {
+                window
+                    .read(cx)
+                    .is_ok_and(|multi_workspace| multi_workspace.multi_workspace_enabled(cx))
+            })
+        });
+
+        if let Some(window) = target_window {
+            open_options.requesting_window = Some(window);
+            window
+                .update(cx, |multi_workspace, _, cx| {
+                    multi_workspace.open_sidebar(cx);
+                })
+                .log_err();
+        }
+    }
+
+    let created_new_window = open_options.requesting_window.is_none();
 
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {
@@ -501,7 +533,7 @@ mod tests {
     use super::*;
     use extension::ExtensionHostProxy;
     use fs::FakeFs;
-    use gpui::{AppContext, TestAppContext};
+    use gpui::{App, AppContext, Entity, TestAppContext};
     use http_client::BlockedHttpClient;
     use node_runtime::NodeRuntime;
     use remote::RemoteClient;
@@ -962,6 +994,252 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_second_remote_project_joins_existing_window(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let executor = cx.executor();
+
+        let (opts, _headless) = start_mock_remote_server(
+            vec![
+                (
+                    PathBuf::from(path!("/project-one")),
+                    json!({ "main.rs": "fn main() {}" }),
+                ),
+                (
+                    PathBuf::from(path!("/project-two")),
+                    json!({ "lib.rs": "pub fn hello() {}" }),
+                ),
+            ],
+            cx,
+            server_cx,
+        )
+        .await;
+
+        let mut async_cx = cx.to_async();
+        let first_window = open_remote_project(
+            opts.clone(),
+            vec![PathBuf::from(path!("/project-one"))],
+            app_state.clone(),
+            existing_window_open_options(),
+            &mut async_cx,
+        )
+        .await
+        .expect("first open_remote_project should succeed");
+
+        executor.run_until_parked();
+
+        let second_window = open_remote_project(
+            opts.clone(),
+            vec![PathBuf::from(path!("/project-two"))],
+            app_state.clone(),
+            existing_window_open_options(),
+            &mut async_cx,
+        )
+        .await
+        .expect("second open_remote_project should succeed");
+
+        executor.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "a second remote project should join the existing window, not open a new one"
+        );
+        assert_eq!(
+            second_window, first_window,
+            "both remote projects should live in the same window"
+        );
+
+        first_window
+            .update(cx, |multi_workspace, _, cx| {
+                assert_eq!(
+                    workspace_roots(multi_workspace, cx),
+                    vec![
+                        PathBuf::from(path!("/project-one")),
+                        PathBuf::from(path!("/project-two")),
+                    ],
+                    "both remote projects should be held by the window"
+                );
+                assert!(
+                    multi_workspace.sidebar_open(),
+                    "the sidebar should be opened so the added project is visible"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_reopening_remote_project_activates_existing_workspace(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let executor = cx.executor();
+
+        let (opts, _headless) = start_mock_remote_server(
+            vec![
+                (
+                    PathBuf::from(path!("/project-one")),
+                    json!({ "main.rs": "fn main() {}" }),
+                ),
+                (
+                    PathBuf::from(path!("/project-two")),
+                    json!({ "lib.rs": "pub fn hello() {}" }),
+                ),
+            ],
+            cx,
+            server_cx,
+        )
+        .await;
+
+        let mut async_cx = cx.to_async();
+        let window = open_remote_project(
+            opts.clone(),
+            vec![PathBuf::from(path!("/project-one"))],
+            app_state.clone(),
+            existing_window_open_options(),
+            &mut async_cx,
+        )
+        .await
+        .expect("first open_remote_project should succeed");
+
+        executor.run_until_parked();
+
+        let first_workspace = window
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        open_remote_project(
+            opts.clone(),
+            vec![PathBuf::from(path!("/project-two"))],
+            app_state.clone(),
+            existing_window_open_options(),
+            &mut async_cx,
+        )
+        .await
+        .expect("second open_remote_project should succeed");
+
+        executor.run_until_parked();
+
+        // Re-opening a project that is already open must activate its existing
+        // workspace. Building a second workspace for the same paths would
+        // restart that project's remote server underneath the running one.
+        open_remote_project(
+            opts.clone(),
+            vec![PathBuf::from(path!("/project-one"))],
+            app_state.clone(),
+            existing_window_open_options(),
+            &mut async_cx,
+        )
+        .await
+        .expect("re-opening the first project should succeed");
+
+        executor.run_until_parked();
+
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+
+        window
+            .update(cx, |multi_workspace, _, cx| {
+                assert_eq!(
+                    workspace_roots(multi_workspace, cx),
+                    vec![
+                        PathBuf::from(path!("/project-one")),
+                        PathBuf::from(path!("/project-two")),
+                    ],
+                    "re-opening an open project should not add a second workspace for it"
+                );
+                assert_eq!(
+                    multi_workspace.workspace(),
+                    &first_workspace,
+                    "the already-open workspace should have been activated"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The options `open_options_for_behavior` produces for the default
+    /// `cli_default_open_behavior: existing_window`.
+    fn existing_window_open_options() -> workspace::OpenOptions {
+        workspace::OpenOptions {
+            workspace_matching: workspace::WorkspaceMatching::MatchExact,
+            add_dirs_to_sidebar: true,
+            ..Default::default()
+        }
+    }
+
+    fn workspace_roots(multi_workspace: &MultiWorkspace, cx: &App) -> Vec<PathBuf> {
+        let mut roots = multi_workspace
+            .workspaces()
+            .flat_map(|workspace| {
+                workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots
+    }
+
+    /// Starts a mock remote host serving `trees`, with one server session per
+    /// tree so that each project gets its own remote server, as it would over
+    /// a real connection.
+    async fn start_mock_remote_server(
+        trees: Vec<(PathBuf, serde_json::Value)>,
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (RemoteConnectionOptions, Vec<Entity<HeadlessProject>>) {
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        server_cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+
+        let (opts, server_sessions, connect_guard) =
+            RemoteClient::fake_server_with_sessions(trees.len(), cx, server_cx);
+
+        let remote_fs = FakeFs::new(server_cx.executor());
+        for (path, tree) in trees {
+            remote_fs.insert_tree(&path, tree).await;
+        }
+
+        server_cx.update(HeadlessProject::init);
+        let languages = Arc::new(language::LanguageRegistry::new(server_cx.executor()));
+        let headless_projects = server_sessions
+            .into_iter()
+            .map(|session| {
+                server_cx.new(|cx| {
+                    HeadlessProject::new(
+                        HeadlessAppState {
+                            session,
+                            fs: remote_fs.clone(),
+                            http_client: Arc::new(BlockedHttpClient),
+                            node_runtime: NodeRuntime::unavailable(),
+                            languages: languages.clone(),
+                            extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                            startup_time: std::time::Instant::now(),
+                        },
+                        false,
+                        cx,
+                    )
+                })
+            })
+            .collect();
+
+        drop(connect_guard);
+
+        (opts, headless_projects)
     }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
