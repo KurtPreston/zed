@@ -1158,6 +1158,22 @@ impl RemoteClient {
         (opts.into(), server_client, connect_guard)
     }
 
+    /// Like [`Self::fake_server`], but registers `session_count` server
+    /// sessions on one connection so that several projects can be opened over
+    /// it, as they can over a real connection. Build one `HeadlessProject` per
+    /// returned session.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fake_server_with_sessions(
+        session_count: usize,
+        client_cx: &mut gpui::TestAppContext,
+        server_cx: &mut gpui::TestAppContext,
+    ) -> (RemoteConnectionOptions, Vec<AnyProtoClient>, ConnectGuard) {
+        use crate::transport::mock::MockConnection;
+        let (opts, server_clients, connect_guard) =
+            MockConnection::new_with_sessions(session_count, client_cx, server_cx);
+        (opts.into(), server_clients, connect_guard)
+    }
+
     /// Registers a new mock server for existing connection options.
     ///
     /// Use this to simulate reconnection: after forcing a disconnect, register

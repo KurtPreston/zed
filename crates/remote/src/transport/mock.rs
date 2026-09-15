@@ -45,8 +45,10 @@ use futures::{
     select_biased,
 };
 use gpui::{App, AppContext as _, AsyncApp, Global, Task, TestAppContext};
+use parking_lot::Mutex;
 use rpc::{AnyProtoClient, proto::Envelope};
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc,
@@ -64,8 +66,38 @@ pub struct MockConnectionOptions {
 /// A mock implementation of `RemoteConnection` for testing.
 pub struct MockRemoteConnection {
     options: MockConnectionOptions,
-    server_channel: Arc<ChannelClient>,
+    server_channels: Mutex<MockServerChannels>,
     server_cx: SendableCx,
+}
+
+/// A real connection runs one remote server process per project, keyed by the
+/// client's unique identifier. The mock mirrors that by giving each new
+/// identifier its own pre-registered server session, so several projects can
+/// share one connection the way they do in production.
+struct MockServerChannels {
+    unclaimed: VecDeque<Arc<ChannelClient>>,
+    claimed: HashMap<String, Arc<ChannelClient>>,
+    most_recent: Arc<ChannelClient>,
+}
+
+impl MockServerChannels {
+    /// Returns the session belonging to `unique_identifier`, claiming a fresh
+    /// one for identifiers seen for the first time. Once the pre-registered
+    /// sessions run out, further identifiers take over the most recent one,
+    /// which is the behavior tests that register a single session expect.
+    fn claim(&mut self, unique_identifier: &str) -> Arc<ChannelClient> {
+        if let Some(channel) = self.claimed.get(unique_identifier) {
+            return channel.clone();
+        }
+        let channel = match self.unclaimed.pop_front() {
+            Some(channel) => channel,
+            None => self.most_recent.clone(),
+        };
+        self.claimed
+            .insert(unique_identifier.to_owned(), channel.clone());
+        self.most_recent = channel.clone();
+        channel
+    }
 }
 
 /// Wrapper to pass `AsyncApp` across thread boundaries in tests.
@@ -142,12 +174,24 @@ impl MockConnection {
         client_cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
     ) -> (MockConnectionOptions, AnyProtoClient, ConnectGuard) {
+        let (opts, mut server_clients, connect_guard) =
+            Self::new_with_sessions(1, client_cx, server_cx);
+        (opts, server_clients.remove(0), connect_guard)
+    }
+
+    /// Creates a mock connection that can serve `session_count` projects, one
+    /// server session per project, as a real connection does.
+    pub(crate) fn new_with_sessions(
+        session_count: usize,
+        client_cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (MockConnectionOptions, Vec<AnyProtoClient>, ConnectGuard) {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let opts = MockConnectionOptions { id };
-        let (server_client, connect_guard) =
-            Self::new_with_opts(opts.clone(), client_cx, server_cx);
-        (opts, server_client, connect_guard)
+        let (server_clients, connect_guard) =
+            Self::new_with_opts_and_sessions(opts.clone(), session_count, client_cx, server_cx);
+        (opts, server_clients, connect_guard)
     }
 
     /// Creates a mock connection pair for existing `MockConnectionOptions`.
@@ -160,14 +204,38 @@ impl MockConnection {
         client_cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
     ) -> (AnyProtoClient, ConnectGuard) {
-        let (outgoing_tx, _) = mpsc::unbounded::<Envelope>();
-        let (_, incoming_rx) = mpsc::unbounded::<Envelope>();
-        let server_client = server_cx
-            .update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "mock-server", false));
+        let (mut server_clients, connect_guard) =
+            Self::new_with_opts_and_sessions(opts, 1, client_cx, server_cx);
+        (server_clients.remove(0), connect_guard)
+    }
+
+    fn new_with_opts_and_sessions(
+        opts: MockConnectionOptions,
+        session_count: usize,
+        client_cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (Vec<AnyProtoClient>, ConnectGuard) {
+        let server_channels = (0..session_count)
+            .map(|_| {
+                let (outgoing_tx, _) = mpsc::unbounded::<Envelope>();
+                let (_, incoming_rx) = mpsc::unbounded::<Envelope>();
+                server_cx.update(|cx| {
+                    ChannelClient::new(incoming_rx, outgoing_tx, cx, "mock-server", false)
+                })
+            })
+            .collect::<Vec<_>>();
+        let most_recent = server_channels
+            .first()
+            .cloned()
+            .expect("a mock connection needs at least one server session");
 
         let connection = Arc::new(MockRemoteConnection {
             options: opts.clone(),
-            server_channel: server_client.clone(),
+            server_channels: Mutex::new(MockServerChannels {
+                unclaimed: server_channels.iter().cloned().collect(),
+                claimed: HashMap::default(),
+                most_recent,
+            }),
             server_cx: SendableCx::new(server_cx),
         });
 
@@ -179,7 +247,7 @@ impl MockConnection {
                 .insert(opts.id, (rx, connection));
         });
 
-        (server_client.into(), tx)
+        (server_channels.into_iter().map(Into::into).collect(), tx)
     }
 }
 
@@ -244,13 +312,13 @@ impl RemoteConnection for MockRemoteConnection {
     fn simulate_disconnect(&self, cx: &AsyncApp) {
         let (outgoing_tx, _) = mpsc::unbounded::<Envelope>();
         let (_, incoming_rx) = mpsc::unbounded::<Envelope>();
-        self.server_channel
-            .reconnect(incoming_rx, outgoing_tx, &self.server_cx.get(cx));
+        let server_channel = self.server_channels.lock().most_recent.clone();
+        server_channel.reconnect(incoming_rx, outgoing_tx, &self.server_cx.get(cx));
     }
 
     fn start_proxy(
         &self,
-        _unique_identifier: String,
+        unique_identifier: String,
         _reconnect: bool,
         mut client_incoming_tx: mpsc::UnboundedSender<Envelope>,
         mut client_outgoing_rx: mpsc::UnboundedReceiver<Envelope>,
@@ -261,7 +329,8 @@ impl RemoteConnection for MockRemoteConnection {
         let (mut server_incoming_tx, server_incoming_rx) = mpsc::unbounded::<Envelope>();
         let (server_outgoing_tx, mut server_outgoing_rx) = mpsc::unbounded::<Envelope>();
 
-        self.server_channel.reconnect(
+        let server_channel = self.server_channels.lock().claim(&unique_identifier);
+        server_channel.reconnect(
             server_incoming_rx,
             server_outgoing_tx,
             &self.server_cx.get(cx),
